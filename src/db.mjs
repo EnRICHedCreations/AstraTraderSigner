@@ -1,3 +1,52 @@
-import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync } from 'node:fs';import { dirname } from 'node:path';import { randomUUID } from 'node:crypto';
-export class Store{constructor(path){mkdirSync(dirname(path),{recursive:true});this.db=new DatabaseSync(path);this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE,at INTEGER,kind TEXT,body TEXT); CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,state TEXT NOT NULL,body TEXT NOT NULL,updated INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS reservations(id TEXT PRIMARY KEY,day TEXT NOT NULL,amount INTEGER NOT NULL);`)}tx(fn){this.db.exec('BEGIN IMMEDIATE');try{const r=fn();this.db.exec('COMMIT');return r}catch(e){this.db.exec('ROLLBACK');throw e}}get(k,f=null){const r=this.db.prepare('SELECT value FROM meta WHERE key=?').get(k);return r?JSON.parse(r.value):f}set(k,v){this.db.prepare('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(k,JSON.stringify(v))}event(kind,body){this.db.prepare('INSERT INTO events(id,at,kind,body) VALUES(?,?,?,?)').run(randomUUID(),Date.now(),kind,JSON.stringify(body))}order(id){const r=this.db.prepare('SELECT body,state FROM orders WHERE id=?').get(id);return r?{...JSON.parse(r.body),state:r.state}:null}orders(){return this.db.prepare('SELECT body,state FROM orders ORDER BY updated DESC').all().map(r=>({...JSON.parse(r.body),state:r.state}))}saveOrder(o){this.db.prepare('INSERT INTO orders VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state,body=excluded.body,updated=excluded.updated').run(o.id,o.state,JSON.stringify(o),Date.now())}reserve(id,amount,cap){const day=new Date().toISOString().slice(0,10);return this.tx(()=>{const p=this.db.prepare('SELECT amount,day FROM reservations WHERE id=?').get(id);if(p){if(p.amount!==amount||p.day!==day)throw Error('Reservation id conflict');return}const used=this.db.prepare('SELECT COALESCE(SUM(amount),0) total FROM reservations WHERE day=?').get(day).total;if(used+amount>cap)throw Error('Daily spending limit');this.db.prepare('INSERT INTO reservations VALUES(?,?,?)').run(id,day,amount)})}close(){this.db.close()}}
+import { createClient } from '@supabase/supabase-js';
+import { randomUUID } from 'node:crypto';
+
+const T={meta:'astratrader_signer_meta',events:'astratrader_signer_events',orders:'astratrader_signer_orders'};
+function fail(label,error){throw new Error(`${label}: ${error?.message??error}`)}
+
+export class Store{
+  constructor(c){
+    if(!c.supabaseUrl||!c.supabaseServiceRoleKey)throw new Error('Supabase persistence is required');
+    this.db=createClient(c.supabaseUrl,c.supabaseServiceRoleKey,{auth:{persistSession:false,autoRefreshToken:false,detectSessionInUrl:false}});
+  }
+  async init(){
+    const {error}=await this.db.from(T.meta).select('key').limit(1);
+    if(error)fail('Supabase signer persistence unavailable',error);
+  }
+  async get(k,f=null){
+    const {data,error}=await this.db.from(T.meta).select('value').eq('key',k).maybeSingle();
+    if(error)fail('Supabase meta read failed',error);
+    return data?data.value:f;
+  }
+  async set(k,v){
+    const {error}=await this.db.from(T.meta).upsert({key:k,value:v,updated_at:new Date().toISOString()},{onConflict:'key'});
+    if(error)fail('Supabase meta write failed',error);
+  }
+  async event(kind,body){
+    const {error}=await this.db.from(T.events).insert({id:randomUUID(),at:Date.now(),kind,body});
+    if(error)fail('Supabase event write failed',error);
+  }
+  async order(id){
+    const {data,error}=await this.db.from(T.orders).select('body,state').eq('id',id).maybeSingle();
+    if(error)fail('Supabase order read failed',error);
+    return data?{...data.body,state:data.state}:null;
+  }
+  async orders(){
+    const {data,error}=await this.db.from(T.orders).select('body,state').order('updated',{ascending:false});
+    if(error)fail('Supabase orders read failed',error);
+    return (data??[]).map(r=>({...r.body,state:r.state}));
+  }
+  async saveOrder(o){
+    const {error}=await this.db.from(T.orders).upsert({id:o.id,state:o.state,body:o,updated:Date.now()},{onConflict:'id'});
+    if(error)fail('Supabase order write failed',error);
+  }
+  async reserve(id,amount,cap){
+    const {error}=await this.db.rpc('astratrader_signer_reserve',{p_id:id,p_amount:amount,p_cap:cap});
+    if(error){
+      if(/Daily spending limit/i.test(error.message))throw new Error('Daily spending limit');
+      if(/Reservation id conflict/i.test(error.message))throw new Error('Reservation id conflict');
+      fail('Supabase reservation failed',error);
+    }
+  }
+  close(){}
+}
